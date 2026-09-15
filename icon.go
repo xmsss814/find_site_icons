@@ -15,9 +15,9 @@ import (
 type IconKind int
 
 const (
-	AppIcon      IconKind = 0
-	SiteFavicon  IconKind = 1
-	SiteLogo     IconKind = 2
+	AppIcon     IconKind = 0
+	SiteFavicon IconKind = 1
+	SiteLogo    IconKind = 2
 )
 
 var iconKindStrings = map[IconKind]string{

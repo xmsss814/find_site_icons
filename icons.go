@@ -6,14 +6,44 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-var httpClient = &http.Client{
-	Transport: &userAgentTransport{
-		transport: http.DefaultTransport,
-	},
+// defaultTimeout bounds every request made by the scraper. A single target
+// fan-out runs many requests (HTML + manifest + favicon + link icons); each
+// request is capped so a hung host can't stall a whole target indefinitely.
+const defaultTimeout = 12 * time.Second
+
+// requestTimeout returns the per-request timeout, honoring the same knob the
+// orchestrator uses (FIND_SITE_ICONS_TIMEOUT, in seconds) so operators can tune
+// without recompiling.
+func requestTimeout() time.Duration {
+	if v := os.Getenv("FIND_SITE_ICONS_TIMEOUT"); v != "" {
+		if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return defaultTimeout
 }
+
+// newHTTPClient builds an http.Client whose Transport sets a Chrome-like
+// User-Agent and whose Timeout bounds the full request lifecycle (connect +
+// headers + body). The Timeout only applies to each individual request, not
+// to a whole site, so per-target work is bounded by the slowest single request.
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &userAgentTransport{
+			transport: http.DefaultTransport,
+		},
+	}
+}
+
+var httpClient = newHTTPClient(requestTimeout())
 
 // userAgentTransport adds a Chrome-like User-Agent to all requests.
 type userAgentTransport struct {
@@ -93,24 +123,36 @@ func (s *SiteIcons) LoadWebsite(urlStr string, bestMatchesOnly bool) ([]*Icon, e
 	})
 
 	results := make(chan loadedResult, 4)
+	// done aborts stragglers when we stop reading results early (--fast).
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	closeDone := func() { doneOnce.Do(func() { close(done) }) }
+	defer closeDone()
+
+	sendResult := func(r loadedResult) {
+		select {
+		case results <- r:
+		case <-done:
+		}
+	}
 
 	// Start manifest and favicon requests immediately — they don't depend on HTML.
-	go s.loadManifestGoroutine(manifestURLs, results)
-	go s.loadFaviconGoroutine(faviconURLs, results)
+	go s.loadManifestGoroutine(manifestURLs, sendResult)
+	go s.loadFaviconGoroutine(faviconURLs, sendResult)
 
 	// Download HTML and stream to both parsers concurrently.
 	resp, err := httpClient.Get(pageURL.String())
 	if err != nil || resp == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// HTML fetch failed — send empty results for head/site-logo.
-		results <- loadedResult{kind: kindHeadTags}
-		results <- loadedResult{kind: kindSiteLogo}
+		sendResult(loadedResult{kind: kindHeadTags})
+		sendResult(loadedResult{kind: kindSiteLogo})
 	} else {
 		defer resp.Body.Close()
 		finalURL := resp.Request.URL
 
 		if s.IsBlacklisted(finalURL) {
-			results <- loadedResult{kind: kindHeadTags}
-			results <- loadedResult{kind: kindSiteLogo}
+			sendResult(loadedResult{kind: kindHeadTags})
+			sendResult(loadedResult{kind: kindSiteLogo})
 		} else {
 			// Fan out the body stream to two channels: one for head parser, one for site logo.
 			headCh := make(chan chunk, 64)
@@ -135,10 +177,10 @@ func (s *SiteIcons) LoadWebsite(urlStr string, bestMatchesOnly bool) ([]*Icon, e
 			}()
 
 			// Head parser: receives body chunks via an io.Pipe, discovers and loads icons concurrently.
-			go s.loadHeadGoroutine(finalURL, headCh, results)
+			go s.loadHeadGoroutine(finalURL, headCh, sendResult)
 
 			// Site logo parser: needs full body, buffers all chunks then parses.
-			go s.loadSiteLogoGoroutine(finalURL, logoCh, results)
+			go s.loadSiteLogoGoroutine(finalURL, logoCh, sendResult)
 		}
 	}
 
@@ -193,39 +235,56 @@ func (s *SiteIcons) LoadWebsite(urlStr string, bestMatchesOnly bool) ([]*Icon, e
 		}
 	}
 
+	// With --fast we may stop reading before all 4 results arrive; close(done)
+	// (via the deferred closeDone) unblocks any straggler send so its goroutine
+	// can exit instead of leaking.
 	return icons, nil
 }
 
-func (s *SiteIcons) loadManifestGoroutine(manifestURLs []string, results chan<- loadedResult) {
+func (s *SiteIcons) loadManifestGoroutine(manifestURLs []string, send func(loadedResult)) {
 	for _, mu := range manifestURLs {
 		icons, err := loadManifest(mu)
 		if err == nil && len(icons) > 0 {
-			results <- loadedResult{kind: kindManifest, icons: icons}
+			send(loadedResult{kind: kindManifest, icons: icons})
 			return
 		}
+		// A connection-level failure (unroutable, refused, DNS) applies to
+		// every remaining URL on the same host — don't burn a full timeout
+		// per candidate path.
+		if isDialError(err) {
+			break
+		}
 	}
-	results <- loadedResult{kind: kindManifest}
+	send(loadedResult{kind: kindManifest})
 }
 
-func (s *SiteIcons) loadFaviconGoroutine(faviconURLs []string, results chan<- loadedResult) {
+func (s *SiteIcons) loadFaviconGoroutine(faviconURLs []string, send func(loadedResult)) {
 	for _, fu := range faviconURLs {
 		icon, err := LoadIcon(fu, SiteFavicon, nil, nil)
 		if err == nil {
-			results <- loadedResult{kind: kindDefaultFavicon, single: icon}
+			send(loadedResult{kind: kindDefaultFavicon, single: icon})
 			return
 		}
+		if isDialError(err) {
+			break
+		}
 	}
-	results <- loadedResult{kind: kindDefaultFavicon}
+	send(loadedResult{kind: kindDefaultFavicon})
 }
 
-func (s *SiteIcons) loadHeadGoroutine(pageURL *url.URL, headCh <-chan chunk, results chan<- loadedResult) {
+func (s *SiteIcons) loadHeadGoroutine(pageURL *url.URL, headCh <-chan chunk, send func(loadedResult)) {
 	pr, pw := io.Pipe()
 
-	// Feed chunks from channel into the pipe writer.
+	// Feed chunks from channel into the pipe writer. If the head parser
+	// detached early (</head> reached), writes fail — but we must keep
+	// draining headCh so the body pump (also feeding logoCh) never blocks;
+	// otherwise the whole target's logo detection would stall behind it.
 	go func() {
 		defer pw.Close()
 		for c := range headCh {
 			if _, err := pw.Write(c.data); err != nil {
+				for range headCh {
+				}
 				return
 			}
 		}
@@ -236,23 +295,20 @@ func (s *SiteIcons) loadHeadGoroutine(pageURL *url.URL, headCh <-chan chunk, res
 		icons = append(icons, icon)
 	}
 
-	if len(icons) > 0 {
-		results <- loadedResult{kind: kindHeadTags, icons: icons}
-	} else {
-		results <- loadedResult{kind: kindHeadTags}
-	}
+	send(loadedResult{kind: kindHeadTags, icons: icons})
 }
 
-func (s *SiteIcons) loadSiteLogoGoroutine(pageURL *url.URL, logoCh <-chan chunk, results chan<- loadedResult) {
+func (s *SiteIcons) loadSiteLogoGoroutine(pageURL *url.URL, logoCh <-chan chunk, send func(loadedResult)) {
 	var buf bytes.Buffer
+	buf.Grow(512 * 1024)
 	for c := range logoCh {
 		buf.Write(c.data)
 	}
 
 	icon, err := parseSiteLogo(pageURL, buf.String(), s.IsBlacklisted)
 	if err == nil && icon != nil {
-		results <- loadedResult{kind: kindSiteLogo, single: icon}
+		send(loadedResult{kind: kindSiteLogo, single: icon})
 	} else {
-		results <- loadedResult{kind: kindSiteLogo}
+		send(loadedResult{kind: kindSiteLogo})
 	}
 }

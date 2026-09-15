@@ -32,6 +32,14 @@ func parseHead(pageURL *url.URL, body io.Reader) <-chan *Icon {
 			case html.EndTagToken:
 				name, _ := tokenizer.TagName()
 				if strings.EqualFold(string(name), "head") {
+					// Head section done. Detach the parser from the shared
+					// body stream: closing the pipe reader makes the feed
+					// goroutine's writes fail fast, and it keeps draining its
+					// channel so the body pump (which also feeds the
+					// site-logo side) never blocks.
+					if pc, ok := body.(interface{ CloseWithError(error) error }); ok {
+						pc.CloseWithError(io.EOF)
+					}
 					wg.Wait()
 					return
 				}
